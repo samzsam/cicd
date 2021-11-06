@@ -11,7 +11,7 @@ pipeline {
                 sh 'pwd '
             }
         }
-        stage('build location') {
+        stage('build dev image') {
             steps {
                 sh 'docker build -t webapp-dev:latest ./ '
             }
