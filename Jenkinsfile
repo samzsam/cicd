@@ -14,11 +14,12 @@ pipeline {
         stage('build dev image') {
             steps {
                 sh 'docker build -t webapp-dev:latest ./ '
-i            }
+            }
         }
         stage('Remove Old container') {
             steps {
                 sh 'docker stop dev-webapp'
+		sh 'docker system prune -f'
             }
         }
  	stage('Deploy dev webapp') {
