@@ -11,6 +11,11 @@ pipeline {
                 sh 'pwd '
             }
         }
+        stage('Git pull') {
+            steps {
+                sh 'git pull dev'
+            }
+        }
         stage('build dev image') {
             steps {
                 sh 'docker build -t webapp-dev:latest ./ '
