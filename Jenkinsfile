@@ -16,6 +16,12 @@ pipeline {
                 sh 'docker build -t webapp-dev:latest ./ '
             }
         }
+ 	stage('Deploy dev webapp') {
+            steps {
+                sh 'docker run -p 80:80 -d -t dev-webapp  webapp-dev:latest'
+            }
+        }
+
 
    }
 }
