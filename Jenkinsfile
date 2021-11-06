@@ -18,7 +18,7 @@ pipeline {
         }
         stage('Remove Old container') {
 	    steps {
-                sh 'docker ps -aqf "name=dev-webapp"] && docker stop dev-webapp && docker system prune -f || echo 0'
+                sh 'docker ps -aqf "name=dev-webapp"] && {docker stop dev-webapp; docker system prune -f;} || echo 0'
             }
         }
  	stage('Deploy dev webapp') {
