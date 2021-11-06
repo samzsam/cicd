@@ -18,7 +18,7 @@ pipeline {
         }
         stage('Remove Old container') {
             steps {
-                sh '  if [ ! "$(docker ps -q -f name=dev-webapp)" ]; then                        if [ "$(docker ps -aq -f status=exited -f name=dev-webapp)" ]; then                        # cleanup                        docker rm dev-webapp                        fi'
+                sh '[ "$(docker ps -a | grep dev-webapp)" ] ||  docker stop dev-webapp'
         	sh 'docker system prune -f'
             }
         }
