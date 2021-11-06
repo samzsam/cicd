@@ -14,7 +14,7 @@ pipeline {
         stage('Git pull') {
             steps {
                 sh 'git config pull.rebase true'
-                sh 'git pull dev'
+                sh 'git pull'
             }
         }
         stage('build dev image') {
