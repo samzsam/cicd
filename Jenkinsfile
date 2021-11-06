@@ -18,7 +18,7 @@ pipeline {
         }
  	stage('Deploy dev webapp') {
             steps {
-                sh 'docker run -p 80:80 -d -t dev-webapp  webapp-dev:latest'
+                sh 'docker run -t webapp -p 80:80 -d  webapp-dev:latest'
             }
         }
 
