@@ -1,0 +1,30 @@
+{
+  "nessus": {
+    "installPath": "/opt/nessus/sbin",
+    "dataPath": "/opt/nessus/var/nessus",
+    "configPath": "/opt/nessus/etc/nessus",
+    "webUrl": "https://localhost:8834",
+    "accessKey": "",
+    "secretKey": ""
+  },
+  "tenable": {
+    "licenseCode": "",
+    "pluginFeedUrl": "https://plugins.nessus.org/v2/nessus.php",
+    "challengeCode": ""
+  },
+  "nexus": {
+    "url": "http://localhost:8081",
+    "repository": "nessus-plugins",
+    "username": "admin",
+    "password": ""
+  },
+  "pluginStorage": {
+    "localPath": "/var/lib/nessus-plugins",
+    "retentionDays": 30
+  },
+  "schedule": {
+    "downloadCron": "0 2 * * 0",
+    "applyAfterScan": true,
+    "manualApprovalRequired": true
+  }
+}
