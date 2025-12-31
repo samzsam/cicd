@@ -1,0 +1,608 @@
+#!/usr/bin/env groovy
+
+@Library('jenkins-standard-library@release/2.1')
+import gov.cms.scm.Repository
+
+pipeline {
+    parameters {
+        choice(
+            name: 'pluginAction',
+            choices: ['full-sync', 'download-only', 'upload-only', 'scan-only', 'install-only'],
+            description: '<p style="color:#1782FC;">Select the plugin management action to perform</p>'
+        )
+
+        string(
+            name: 'pluginVersion',
+            defaultValue: 'latest',
+            description: '<p style="color:#1782FC;">Plugin version to deploy (latest or date format: yyyy/MM/dd)</p>',
+            trim: true
+        )
+
+        string(
+            name: 'targetNessusHosts',
+            defaultValue: '',
+            description: '<p style="color:#1782FC;">Comma-separated list of Nessus scanner IPs for plugin sync (leave empty for local only)</p>',
+            trim: true
+        )
+
+        booleanParam(
+            name: 'forceDownload',
+            description: '<p style="color:#1782FC;">Force download even if plugins were downloaded recently</p>',
+            defaultValue: false
+        )
+
+        booleanParam(
+            name: 'skipScan',
+            description: '<p style="color:#1782FC;">Skip the security scan stage</p>',
+            defaultValue: false
+        )
+
+        booleanParam(
+            name: 'dryRun',
+            description: '<p style="color:#1782FC;">Run without applying plugins to Nessus scanners</p>',
+            defaultValue: false
+        )
+
+        booleanParam(
+            name: 'downloadArtifacts',
+            description: '<p style="color:#1782FC;">Check to download plugin artifacts from S3</p>',
+            defaultValue: false
+        )
+
+        string(
+            name: 's3ArtifactPaths',
+            defaultValue: '',
+            description: '<p style="color:#1782FC;">Enter S3 artifact paths to download (comma-separated)</p>',
+            trim: true
+        )
+    }
+
+    agent {
+        node {
+            label 'JenkinsBuild'
+        }
+    }
+
+    tools {
+        jdk 'OpenJDK 17'
+    }
+
+    options {
+        timeout(time: 120, unit: 'MINUTES')
+        ansiColor('xterm')
+        buildDiscarder(logRotator(
+            artifactDaysToKeepStr: '',
+            artifactNumToKeepStr: '',
+            daysToKeepStr: '',
+            numToKeepStr: discardOldBuilds()
+        ))
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        NEXUS_CREDS = credentials('da-ss-jenkins-nexus-creds')
+        NESSUS_CREDS = credentials('da-ss-jenkins-nessus-pw')
+        bucketName = "ffe-ops-ne-ss-hc-s-${HCM_ENV}-devsecops"
+        sslCertPath = "/nfs/ssl/certs/ca-bundle.crt"
+        appSecEmail = "CMS.FFE.Security.Application@cms.sri.ram.cherukurigafs.com"
+        CONFIG_PATH = "config/settings-linux.json"
+        PLUGIN_STORAGE = "/var/lib/nessus-plugins"
+    }
+
+    stages {
+        stage('Setup Environment & Python venv') {
+            when {
+                expression {
+                    return !params.downloadArtifacts
+                }
+            }
+            steps {
+                script {
+                    log.info('=== Setting up Nessus Plugin Manager Environment ===')
+                    log.info('Plugin Action: ' + params.pluginAction)
+                    log.info('Plugin Version: ' + params.pluginVersion)
+                    log.info('Target Hosts: ' + (params.targetNessusHosts ?: 'local'))
+
+                    // Setup Python virtual environment
+                    dir(WORKSPACE + '/nessus-plugin-manager') {
+                        sh('python3.12 -m venv venv && ./venv/bin/python3 -m pip install -r requirements.txt')
+                    }
+
+                    // Create artifact directories
+                    sh """
+                        mkdir -p ${WORKSPACE}/plugin-artifacts
+                        mkdir -p ${WORKSPACE}/logs
+                    """
+
+                    // Set build display name
+                    currentBuild.displayName = '#' + env.BUILD_NUMBER + ' ' + params.pluginAction + ' v:' + params.pluginVersion
+
+                    log.info('Environment setup completed')
+                }
+            }
+        }
+
+        stage('download-ns-plugins') {
+            when {
+                expression {
+                    return !params.downloadArtifacts && (
+                        params.pluginAction == 'full-sync' ||
+                        params.pluginAction == 'download-only'
+                    )
+                }
+            }
+            steps {
+                script {
+                    log.info('=== Stage: Download Nessus Plugins ===')
+                    log.info('Force Download: ' + params.forceDownload)
+
+                    dir(WORKSPACE + '/nessus-plugin-manager') {
+                        def forceFlag = params.forceDownload ? '--force' : ''
+
+                        sh """
+                            chmod +x scripts/*.sh
+                            ./scripts/download-nessus-plugins.sh \
+                                --config "${CONFIG_PATH}" \
+                                ${forceFlag}
+                        """
+
+                        // Get plugin archive info
+                        def archiveInfo = sh(
+                            script: 'jq -r ".pluginStorage.localPath" ${CONFIG_PATH}',
+                            returnStdout: true
+                        ).trim()
+
+                        log.info('Plugins downloaded to: ' + archiveInfo)
+
+                        // Calculate SHA256 for audit
+                        def sha256 = sh(
+                            script: "sha256sum ${archiveInfo}/latest-plugins.tar.gz | awk '{print \$1}'",
+                            returnStdout: true
+                        ).trim()
+
+                        log.info('Plugin archive SHA256: ' + sha256)
+                        writeFile file: "${WORKSPACE}/plugin-artifacts/plugin-sha256.txt", text: sha256
+                    }
+                }
+            }
+            post {
+                success {
+                    script {
+                        log.info('Plugins downloaded successfully')
+                        archiveArtifacts artifacts: 'logs/download.log', allowEmptyArchive: true
+                    }
+                }
+                failure {
+                    script {
+                        log.error('Plugin download failed')
+                    }
+                }
+            }
+        }
+
+        stage('upload-to-nexus') {
+            when {
+                expression {
+                    return !params.downloadArtifacts && (
+                        params.pluginAction == 'full-sync' ||
+                        params.pluginAction == 'upload-only'
+                    )
+                }
+            }
+            steps {
+                script {
+                    log.info('=== Stage: Upload to Nexus Repository ===')
+
+                    dir(WORKSPACE + '/nessus-plugin-manager') {
+                        sh """
+                            ./scripts/upload-to-nexus.sh \
+                                --config "${CONFIG_PATH}" \
+                                --nexus-user "${NEXUS_CREDS_USR}" \
+                                --nexus-pass "${NEXUS_CREDS_PSW}"
+                        """
+                    }
+
+                    // Upload to S3 for backup
+                    def timestamp = new Date().format("yyyyMMdd-HHmmss")
+                    def s3Path = "nessus-plugins/${timestamp}"
+
+                    sh """
+                        aws s3 cp ${PLUGIN_STORAGE}/latest-plugins.tar.gz \
+                            s3://${bucketName}/${s3Path}/nessus-plugins-${timestamp}.tar.gz \
+                            --quiet
+                    """
+
+                    log.info('Plugins uploaded to Nexus and S3: ' + s3Path)
+                }
+            }
+            post {
+                success {
+                    script {
+                        log.info('Plugins uploaded to Nexus successfully')
+                        archiveArtifacts artifacts: 'logs/upload.log', allowEmptyArchive: true
+                    }
+                }
+                failure {
+                    script {
+                        log.error('Nexus upload failed')
+                    }
+                }
+            }
+        }
+
+        stage('scan-ns-plugins') {
+            when {
+                expression {
+                    return !params.downloadArtifacts && !params.skipScan && (
+                        params.pluginAction == 'full-sync' ||
+                        params.pluginAction == 'scan-only'
+                    )
+                }
+            }
+            steps {
+                script {
+                    log.info('=== Stage: Scan Nessus Plugins ===')
+                    log.info('Running security and integrity scans on plugin archive...')
+
+                    def archivePath = sh(
+                        script: "jq -r '.pluginStorage.localPath' ${WORKSPACE}/nessus-plugin-manager/${CONFIG_PATH}",
+                        returnStdout: true
+                    ).trim() + '/latest-plugins.tar.gz'
+
+                    // Integrity verification
+                    log.info('Verifying archive integrity...')
+                    sh """
+                        echo "Checking archive structure..."
+                        tar -tzf "${archivePath}" | head -20
+
+                        # Validate expected plugin structure
+                        if ! tar -tzf "${archivePath}" | grep -q "^plugins/"; then
+                            echo "Invalid plugin archive structure: missing plugins directory"
+                            exit 1
+                        fi
+
+                        echo "Archive validation passed"
+                    """
+
+                    // Get archive size
+                    def archiveSize = sh(
+                        script: "stat -c%s '${archivePath}' 2>/dev/null || stat -f%z '${archivePath}'",
+                        returnStdout: true
+                    ).trim()
+
+                    log.info('Archive size: ' + (archiveSize.toLong() / 1024 / 1024).round(2) + ' MB')
+
+                    // ClamAV malware scan
+                    log.info('Running malware scan...')
+                    def scanResult = sh(
+                        script: """
+                            if command -v clamscan &> /dev/null; then
+                                echo "Running ClamAV scan..."
+                                clamscan --infected --recursive "${archivePath}" 2>&1 || true
+                            else
+                                echo "ClamAV not available, skipping malware scan"
+                            fi
+                        """,
+                        returnStdout: true
+                    )
+
+                    log.info('Scan result: ' + scanResult)
+
+                    // Write scan report
+                    def scanReport = [
+                        timestamp: new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+                        archivePath: archivePath,
+                        archiveSize: archiveSize,
+                        sha256: readFile("${WORKSPACE}/plugin-artifacts/plugin-sha256.txt").trim(),
+                        integrityCheck: 'PASSED',
+                        malwareScan: scanResult.contains('Infected files: 0') ? 'CLEAN' : 'CHECK_REQUIRED'
+                    ]
+
+                    writeFile file: "${WORKSPACE}/plugin-artifacts/scan-report.json", text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(scanReport))
+
+                    log.info('Plugin scan completed')
+                }
+            }
+            post {
+                success {
+                    script {
+                        log.info('Plugin scan completed successfully')
+                        archiveArtifacts artifacts: 'plugin-artifacts/scan-report.json', allowEmptyArchive: true
+                    }
+                }
+                failure {
+                    script {
+                        log.error('Plugin scan failed - archive may be corrupted or contain issues')
+                    }
+                }
+            }
+        }
+
+        stage('push-ns-plugins') {
+            when {
+                expression {
+                    return !params.downloadArtifacts && (
+                        params.pluginAction == 'full-sync'
+                    )
+                }
+            }
+            steps {
+                script {
+                    log.info('=== Stage: Push Nessus Plugins ===')
+                    log.info('Publishing plugin artifacts for distribution...')
+
+                    def timestamp = new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+                    def sha256 = readFile("${WORKSPACE}/plugin-artifacts/plugin-sha256.txt").trim()
+
+                    // Read Nexus config
+                    def nexusUrl = sh(
+                        script: "jq -r '.nexus.url' ${WORKSPACE}/nessus-plugin-manager/${CONFIG_PATH}",
+                        returnStdout: true
+                    ).trim()
+
+                    def repoName = sh(
+                        script: "jq -r '.nexus.repository' ${WORKSPACE}/nessus-plugin-manager/${CONFIG_PATH}",
+                        returnStdout: true
+                    ).trim()
+
+                    // Create distribution manifest
+                    def manifest = [
+                        version: params.pluginVersion,
+                        buildNumber: env.BUILD_NUMBER,
+                        buildUrl: env.BUILD_URL,
+                        timestamp: timestamp,
+                        sha256: sha256,
+                        nexusUrl: "${nexusUrl}/repository/${repoName}/latest/nessus-plugins-latest.tar.gz",
+                        s3Url: "s3://${bucketName}/nessus-plugins/latest/",
+                        status: 'approved'
+                    ]
+
+                    writeFile file: "${WORKSPACE}/plugin-artifacts/distribution-manifest.json", text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(manifest))
+
+                    log.info('Distribution manifest created')
+
+                    // Upload manifest to Nexus
+                    sh """
+                        curl -u "${NEXUS_CREDS_USR}:${NEXUS_CREDS_PSW}" \
+                            -X PUT \
+                            -H "Content-Type: application/json" \
+                            -d @${WORKSPACE}/plugin-artifacts/distribution-manifest.json \
+                            "${nexusUrl}/repository/${repoName}/latest/distribution-manifest.json"
+                    """
+
+                    // Upload manifest to S3
+                    sh """
+                        aws s3 cp ${WORKSPACE}/plugin-artifacts/distribution-manifest.json \
+                            s3://${bucketName}/nessus-plugins/latest/distribution-manifest.json \
+                            --quiet
+                    """
+
+                    log.info('Manifest pushed to Nexus and S3')
+                }
+            }
+            post {
+                success {
+                    script {
+                        log.info('Plugins pushed successfully')
+                        archiveArtifacts artifacts: 'plugin-artifacts/distribution-manifest.json', allowEmptyArchive: true
+                    }
+                }
+                failure {
+                    script {
+                        log.error('Plugin push failed')
+                    }
+                }
+            }
+        }
+
+        stage('sync-install-plugins') {
+            when {
+                expression {
+                    return !params.downloadArtifacts && !params.dryRun && (
+                        params.pluginAction == 'full-sync' ||
+                        params.pluginAction == 'install-only'
+                    )
+                }
+            }
+            steps {
+                script {
+                    log.info('=== Stage: Sync and Install Plugins ===')
+                    log.info('Version: ' + params.pluginVersion)
+
+                    def targetHosts = params.targetNessusHosts ? params.targetNessusHosts.split(',').collect { it.trim() } : ['local']
+                    log.info('Target Hosts: ' + targetHosts.join(', '))
+
+                    def ssh_credentials = [
+                        'da-nessus-scanner-dev', 'da-nessus-scanner-test',
+                        'da-ss-dev', 'da-ss-test'
+                    ]
+
+                    for (targetHost in targetHosts) {
+                        log.info('Installing plugins on: ' + targetHost)
+
+                        if (targetHost == 'local') {
+                            // Local installation
+                            dir(WORKSPACE + '/nessus-plugin-manager') {
+                                sh """
+                                    ./scripts/apply-plugins-from-nexus.sh \
+                                        --config "${CONFIG_PATH}" \
+                                        --version "${params.pluginVersion}" \
+                                        --force
+                                """
+                            }
+                            log.info('Local plugin installation completed')
+                        } else {
+                            // Remote installation via SSH
+                            log.info('Checking connectivity to ' + targetHost)
+
+                            def ipReachable = sh(script: 'nc -z -w 5 ' + targetHost + ' 22', returnStatus: true) == 0
+                            if (!ipReachable) {
+                                log.error('IP ' + targetHost + ' is not reachable on port 22')
+                                error('SSH connectivity check failed for ' + targetHost)
+                            }
+
+                            def sshSuccessful = false
+                            for (def cred in ssh_credentials) {
+                                try {
+                                    shAgent(credentials: cred) {
+                                        sh """
+                                            ssh -q -o StrictHostKeyChecking=no ansible@${targetHost} "
+                                                cd /opt/nessus-plugin-manager && \
+                                                sudo ./scripts/apply-plugins-from-nexus.sh \
+                                                    --config config/settings-linux.json \
+                                                    --version ${params.pluginVersion} \
+                                                    --force
+                                            "
+                                        """
+                                        sshSuccessful = true
+                                        log.info('Successfully synced plugins to ' + targetHost + ' using credential: ' + cred)
+                                    }
+                                    break
+                                } catch (Exception e) {
+                                    log.error('Failed to use credential ' + cred + ': ' + e.message)
+                                }
+                            }
+
+                            if (!sshSuccessful) {
+                                error('Failed to sync plugins to ' + targetHost + ' using any of the provided SSH credentials')
+                            }
+                        }
+                    }
+
+                    // Send notification email
+                    emailNotification(targetHosts.join(', '), params.pluginVersion)
+                }
+            }
+            post {
+                success {
+                    script {
+                        log.info('Plugin sync and installation completed successfully')
+                        archiveArtifacts artifacts: 'logs/apply.log', allowEmptyArchive: true
+                    }
+                }
+                failure {
+                    script {
+                        log.error('Plugin sync/installation failed')
+                    }
+                }
+            }
+        }
+
+        stage('Download Plugin Artifacts from S3') {
+            when {
+                expression {
+                    return params.downloadArtifacts
+                }
+            }
+            steps {
+                script {
+                    log.info('Download Plugin Artifacts from S3 bucket')
+                    currentBuild.displayName = '#' + env.BUILD_NUMBER + ' - Download Artifacts'
+
+                    if (!params.s3ArtifactPaths) {
+                        error('No S3 artifact paths provided')
+                    }
+
+                    sh "mkdir -p ${WORKSPACE}/plugin-downloads"
+
+                    params.s3ArtifactPaths.split(',').each { s3Path ->
+                        def trimmedPath = s3Path.trim()
+                        log.info('Downloading: ' + trimmedPath)
+                        sh "aws s3 cp s3://${bucketName}/nessus-plugins/${trimmedPath} ${WORKSPACE}/plugin-downloads/ --quiet"
+                    }
+
+                    archiveArtifacts(
+                        artifacts: 'plugin-downloads/**/*',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+
+                    log.info('Artifacts downloaded successfully')
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                log.info('=== Pipeline Completed ===')
+                log.info('Build Number: ' + env.BUILD_NUMBER)
+                log.info('Build Status: ' + currentBuild.currentResult)
+
+                // Archive all logs
+                archiveArtifacts artifacts: 'logs/**/*.log', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'plugin-artifacts/**/*', allowEmptyArchive: true
+            }
+        }
+        success {
+            script {
+                log.info('The Nessus Plugin Manager build was successful.')
+            }
+        }
+        failure {
+            script {
+                log.error('The Nessus Plugin Manager build was unsuccessful.')
+
+                // Send failure notification
+                def failureEmailBody = buildFailureEmailBody()
+                emailext subject: 'Nessus Plugin Manager - BUILD FAILED - #' + env.BUILD_NUMBER,
+                    mimeType: 'text/html',
+                    body: failureEmailBody,
+                    to: appSecEmail
+            }
+        }
+    }
+}
+
+def emailNotification(String targetHosts, String pluginVersion) {
+    def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss")
+    def s3ArtifactPath = "nessus-plugins/latest/"
+
+    def jenkinsJobUrl = JENKINS_URL + 'view/2-Apps/view/Security/view/Security_Jobs/job/Nessus/job/Nessus_Plugin_Manager/buildWithParameters?downloadArtifacts=true&s3ArtifactPaths=' + s3ArtifactPath
+
+    def emailSubject = 'Nessus Plugin Update - ' + pluginVersion + ' - Deployed Successfully'
+
+    def appSecEmailBody = ''
+    appSecEmailBody += '<p>All Team,</p>'
+    appSecEmailBody += '<p/>'
+    appSecEmailBody += '<p>Nessus plugins have been successfully updated on the following scanners.</p>'
+    appSecEmailBody += '<p/> <p/>'
+    appSecEmailBody += '<p><b>' + env.JOB_NAME + '</b> ' + env.BUILD_DISPLAY_NAME + '</p>'
+    appSecEmailBody += '<p/> <p/>'
+    appSecEmailBody += '<p>Click console output at <a href=' + env.BUILD_URL + '>' + env.BUILD_URL + '</a> to view the results.</p>'
+    appSecEmailBody += '<p/> <p/>'
+    appSecEmailBody += '<p><b>Plugin Version: </b>' + pluginVersion + '</p>'
+    appSecEmailBody += '<p><b>Target Scanners: </b>' + targetHosts + '</p>'
+    appSecEmailBody += '<p><b>Timestamp: </b>' + timestamp + '</p>'
+    appSecEmailBody += '<p/>'
+    appSecEmailBody += '<p><b>Download the plugin artifacts: </b> Artifacts can be downloaded using Jenkins job: <a href=' + jenkinsJobUrl + '>' + jenkinsJobUrl + '</a> </p>'
+    appSecEmailBody += '<p/> <p/>'
+    appSecEmailBody += '<p>Thanks</p>'
+    appSecEmailBody += '<p/>'
+    appSecEmailBody += '<p>Application Security Team</p>'
+
+    emailext subject: emailSubject, mimeType: 'text/html', body: appSecEmailBody, to: appSecEmail
+}
+
+def buildFailureEmailBody() {
+    def emailBody = ''
+    emailBody += '<p>All Team,</p>'
+    emailBody += '<p/>'
+    emailBody += '<p style="color:red;"><b>Nessus Plugin Manager pipeline has failed.</b></p>'
+    emailBody += '<p/> <p/>'
+    emailBody += '<p><b>' + env.JOB_NAME + '</b> ' + env.BUILD_DISPLAY_NAME + '</p>'
+    emailBody += '<p/>'
+    emailBody += '<p>Click console output at <a href=' + env.BUILD_URL + '>' + env.BUILD_URL + '</a> to view the error details.</p>'
+    emailBody += '<p/> <p/>'
+    emailBody += '<p><b>Action: </b>' + params.pluginAction + '</p>'
+    emailBody += '<p><b>Version: </b>' + params.pluginVersion + '</p>'
+    emailBody += '<p/> <p/>'
+    emailBody += '<p>Please investigate and resolve the issue.</p>'
+    emailBody += '<p/>'
+    emailBody += '<p>Thanks</p>'
+    emailBody += '<p/>'
+    emailBody += '<p>Application Security Team</p>'
+
+    return emailBody
+}
